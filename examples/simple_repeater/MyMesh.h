@@ -35,6 +35,7 @@
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
+#include <helpers/PathFilter.h>
 #include "RateLimiter.h"
 
 #ifdef WITH_BRIDGE
@@ -85,6 +86,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long next_local_advert, next_flood_advert;
   bool _logging;
   NodePrefs _prefs;
+  mesh::PathFilter path_filter;   // per-node flood block list (see helpers/PathFilter.h)
+  uint32_t n_blocked_flood;
   ClientACL  acl;
   CommonCLI _cli;
   uint8_t reply_data[MAX_PACKET_PAYLOAD];
@@ -133,6 +136,7 @@ protected:
   }
 
   bool allowPacketForward(const mesh::Packet* packet) override;
+  bool filterRecvFloodPacket(mesh::Packet* packet) override;
   const char* getLogDateTime() override;
   void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
 
@@ -190,6 +194,11 @@ public:
   bool isHiddenNode() const {
     return _prefs.advert_interval == 0 && _prefs.flood_advert_interval == 0;
   }
+
+  mesh::PathFilter& getPathFilter() { return path_filter; }
+  uint32_t getNumBlockedFlood() const { return n_blocked_flood; }
+  bool loadPathFilter();
+  bool savePathFilter();
 
   void savePrefs() override {
     _cli.savePrefs(_fs);

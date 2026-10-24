@@ -13,6 +13,7 @@ This document provides an overview of CLI commands that can be sent to MeshCore 
   - [Radio](#radio)
   - [System](#system)
   - [Routing](#routing)
+  - [Path Block List](#path-block-list-repeater-only)
   - [ACL](#acl)
   - [Region Management](#region-management-v110)
     - [Region Examples](#region-examples)
@@ -710,6 +711,108 @@ adverts running, set an explicit value in the 60-240 range.
 - `value`: Maximum flood hop count (0-64) for an advert packet
 
 **Default:** `8`
+
+---
+
+### Path Block List (Repeater only)
+
+A repeater can refuse to forward flood packets that arrived through a specific
+repeater. A flood packet's path records every repeater that forwarded it, so the
+last hash in the path is the node that handed the packet over. Entries are
+prefixes of that repeater's public key, which is the same value that appears in
+the path (the first 1-3 bytes of the key).
+
+This only affects FLOOD packets. Direct-routed packets do not record the
+previous hop, and a packet originated by the blocked node starts with an empty
+path, so neither can be matched this way. Path hashes are not authenticated, so
+this is traffic shaping rather than an access control mechanism.
+
+#### Show the block list status
+**Usage:**
+- `block`
+
+**Example:** `> last, nodes=1, minhash=2, blocked=37`
+
+The fields are the current mode, the number of entries, the minimum path hash
+size to enforce on, and how many flood packets have been dropped since boot (or
+since the last `clear stats`).
+
+---
+
+#### List the block list entries
+**Usage:**
+- `block.list`
+
+**Example:** `A1B2C3,0D0E0F`
+
+Returns `-none-` when the list is empty. Each entry is shown as hex.
+
+---
+
+#### Add a repeater to the block list
+**Usage:**
+- `block.add <pubkey-prefix>`
+
+**Parameters:**
+- `pubkey-prefix`: Hex prefix of the repeater's public key, 1-32 bytes (2-64 hex characters). Only the first 3 bytes are stored; 3 bytes are recommended, because a 1-byte prefix also matches roughly 1 in 256 other repeaters.
+
+**Note:** Up to 16 entries can be stored. The list is saved to `/blocklist` and
+survives reboots. The `neighbors` command prints a 4-byte prefix for each
+neighbour, which can be used directly (8 hex characters).
+
+---
+
+#### Remove a repeater from the block list
+**Usage:**
+- `block.remove <pubkey-prefix>`
+
+**Parameters:**
+- `pubkey-prefix`: A prefix of the entry added with `block.add`.
+
+---
+
+#### Remove all entries
+**Usage:**
+- `block.clear`
+
+---
+
+#### Select the path matching mode
+**Usage:**
+- `block.mode <mode>`
+
+**Parameters:**
+- `mode`:
+  - `off`: no filtering (default)
+  - `last`: drop a flood packet if the last path hash (the repeater that handed it over) is in the list
+  - `any`: drop a flood packet if any hop in its path is in the list
+
+**Default:** `off`
+
+---
+
+#### Set the minimum path hash size to enforce on
+**Usage:**
+- `block.minhash <bytes>`
+
+**Parameters:**
+- `bytes`: `1`, `2`, or `3`
+
+**Default:** `1`
+
+**Note:** Path hashes are 1 byte unless the sender uses a wider mode, and a
+1-byte match has a 1 in 256 chance of belonging to a different repeater. Setting
+`block.minhash 2` leaves 1-byte paths unfiltered instead of dropping traffic
+that may not belong to the blocked node; modes and entries are kept.
+
+---
+
+**Example:**
+
+```
+block.mode last
+block.add A1B2C3
+```
 
 ---
 

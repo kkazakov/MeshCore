@@ -458,6 +458,58 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   return true;
 }
 
+bool MyMesh::filterRecvFloodPacket(mesh::Packet *packet) {
+  // Drop flood packets that arrived through a blocked relay. This runs before
+  // the packet is marked 'seen', so a copy arriving over an allowed path can
+  // still be processed and forwarded.
+  if (path_filter.isBlocked(packet->path, packet->getPathHashCount(), packet->getPathHashSize())) {
+    n_blocked_flood++;
+    MESH_DEBUG_PRINTLN("%s filterRecvFloodPacket: dropped, blocked relay", getLogDateTime());
+    return true;
+  }
+  return false;
+}
+
+#define BLOCKLIST_FILE  "/blocklist"
+
+static File openBlocklistWrite(FILESYSTEM* _fs) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(BLOCKLIST_FILE);
+  return _fs->open(BLOCKLIST_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  return _fs->open(BLOCKLIST_FILE, "w");
+#else
+  return _fs->open(BLOCKLIST_FILE, "w", true);
+#endif
+}
+
+bool MyMesh::savePathFilter() {
+  File f = openBlocklistWrite(_fs);
+  if (!f) return false;
+
+  uint8_t buf[8 + mesh::PathFilter::MAX_NODES * sizeof(mesh::PathFilter::Entry)];
+  size_t len = path_filter.serialize(buf, sizeof(buf));
+  bool ok = len > 0 && f.write(buf, len) == len;
+  f.close();
+  return ok;
+}
+
+bool MyMesh::loadPathFilter() {
+  if (!_fs->exists(BLOCKLIST_FILE)) return false;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(BLOCKLIST_FILE, "r");
+#else
+  File f = _fs->open(BLOCKLIST_FILE);
+#endif
+  if (!f) return false;
+
+  uint8_t buf[8 + mesh::PathFilter::MAX_NODES * sizeof(mesh::PathFilter::Entry)];
+  int n = (int)f.read(buf, sizeof(buf));
+  f.close();
+  if (n <= 0) return false;
+  return path_filter.deserialize(buf, (size_t)n);
+}
+
 const char *MyMesh::getLogDateTime() {
   static char tmp[32];
   uint32_t now = getRTCClock()->getCurrentTime();
@@ -951,6 +1003,11 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // TODO: key_store.begin();
   region_map.load(_fs);
 
+  // per-node flood block list
+  n_blocked_flood = 0;
+  path_filter.reset();
+  loadPathFilter();
+
   // establish default-scope
   {
     RegionEntry* r = region_map.getDefaultRegion();
@@ -1193,6 +1250,7 @@ void MyMesh::clearStats() {
   radio_driver.resetStats();
   resetStats();
   ((SimpleMeshTables *)getTables())->resetStats();
+  n_blocked_flood = 0;
 }
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
@@ -1280,6 +1338,83 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else {
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
+    }
+  } else if (memcmp(command, "block", 5) == 0 && (command[5] == 0 || command[5] == ' ' || command[5] == '.')) {
+    // per-node flood block list:  block[.list|.add <hex>|.remove <hex>|.clear|.mode|.minhash]
+    char* sub = command + 5;
+    if (*sub == '.') sub++;
+    while (*sub == ' ') sub++;
+    char* arg = sub;
+    while (*arg && *arg != ' ') arg++;
+    if (*arg) *arg++ = 0;
+    while (*arg == ' ') arg++;
+
+    static const char* modes[] = { "off", "last", "any" };
+
+    if (*sub == 0) {
+      sprintf(reply, "> %s, nodes=%u, minhash=%u, blocked=%lu", modes[path_filter.getMode()],
+              (uint32_t)path_filter.getCount(), (uint32_t)path_filter.getMinHash(),
+              (unsigned long)n_blocked_flood);
+    } else if (strcmp(sub, "list") == 0) {
+      char* dp = reply;
+      for (uint8_t i = 0; i < path_filter.getCount(); i++) {
+        const mesh::PathFilter::Entry* e = path_filter.getEntry(i);
+        if (i) *dp++ = ',';
+        for (uint8_t k = 0; k < e->len; k++) dp += sprintf(dp, "%02X", e->prefix[k]);
+      }
+      *dp = 0;
+      if (dp == reply) strcpy(reply, "-none-");
+    } else if (strcmp(sub, "add") == 0 || strcmp(sub, "remove") == 0) {
+      int hex_len = (int)strlen(arg);
+      if (hex_len < 2 || hex_len > PUB_KEY_SIZE*2 || (hex_len & 1)) {
+        strcpy(reply, "Err - hex pubkey prefix, 1..32 bytes");
+      } else {
+        uint8_t key[PUB_KEY_SIZE];
+        int key_len = hex_len / 2;
+        if (!mesh::Utils::fromHex(key, key_len, arg)) {
+          strcpy(reply, "Err - bad hex");
+        } else if (sub[0] == 'a') {
+          if (!path_filter.contains(key, key_len) && path_filter.getCount() >= mesh::PathFilter::MAX_NODES) {
+            strcpy(reply, "Err - list full");
+          } else {
+            path_filter.add(key, key_len);
+            savePathFilter();
+            sprintf(reply, "OK - %u node(s)", (uint32_t)path_filter.getCount());
+          }
+        } else if (path_filter.remove(key, key_len)) {
+          savePathFilter();
+          strcpy(reply, "OK - removed");
+        } else {
+          strcpy(reply, "Err - not found");
+        }
+      }
+    } else if (strcmp(sub, "clear") == 0) {
+      path_filter.clear();
+      savePathFilter();
+      strcpy(reply, "OK - cleared");
+    } else if (strcmp(sub, "mode") == 0) {
+      uint8_t m = 0xFF;
+      for (uint8_t i = 0; i < 3; i++) {
+        if (strcmp(arg, modes[i]) == 0) { m = i; break; }
+      }
+      if (m == 0xFF) {
+        strcpy(reply, "Err - off|last|any");
+      } else {
+        path_filter.setMode(m);
+        savePathFilter();
+        strcpy(reply, "OK");
+      }
+    } else if (strcmp(sub, "minhash") == 0) {
+      int m = atoi(arg);
+      if (m < 1 || m > 3) {
+        strcpy(reply, "Err - 1|2|3");
+      } else {
+        path_filter.setMinHash((uint8_t)m);
+        savePathFilter();
+        strcpy(reply, "OK");
+      }
+    } else {
+      strcpy(reply, "Err - block [list|add <hex>|remove <hex>|clear|mode <off|last|any>|minhash <1-3>]");
     }
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
